@@ -1,0 +1,28 @@
+# ---- Dependencies ----
+/node_modules
+/.pnp
+.pnp.js
+
+# ---- Secrets / env ----
+.env
+.env.*
+!.env.example
+
+# ---- Next.js build output ----
+/.next/
+/out/
+next-env.d.ts
+*.tsbuildinfo
+
+# ---- Production build ----
+/build
+
+# ---- Logs / debug ----
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ---- Misc ----
+.DS_Store
+.vercel

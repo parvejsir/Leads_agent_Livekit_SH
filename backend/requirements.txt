@@ -1,0 +1,18 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+pydantic
+pydantic-settings
+python-multipart
+aiohttp
+websockets
+twilio
+livekit
+livekit-agents
+livekit-plugins-openai
+livekit-plugins-deepgram
+livekit-plugins-elevenlabs
+livekit-plugins-silero
+livekit-plugins-google
+openai>=1.30.0
+# audioop-lts  # uncomment if upgrading to Python 3.13+
