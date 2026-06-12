@@ -33,7 +33,7 @@ from app.agents.worker_agent.agent import RealEstateAgent
 from app.core.config import SETTINGS
 from app.core.constants import AGENT_NAME
 from app.core.logging import LOGGER
-from app.services.lead_extractor import extract_lead_from_transcript, summarize_transcript
+from app.services.lead_extractor import extract_lead_and_summary
 from app.services.storage_service import save_call_record, save_call_history, upsert_lead
 from app.websocket.connection_manager import CONNECTION_MANAGER
 
@@ -121,7 +121,12 @@ async def entrypoint(ctx: JobContext) -> None:
         ),
         llm=lk_google.LLM(
             api_key=SETTINGS.GEMINI_API_KEY,
-            model="gemini-2.5-flash",
+            # flash-lite has the highest free-tier budget (15 RPM / 1,000 req-day
+            # vs flash's 10 RPM / 250 req-day) and lower latency. The per-turn
+            # conversation LLM is the heaviest Gemini consumer, so it gets the
+            # roomier quota. Post-call extraction stays on full `flash` (a
+            # separate per-model quota bucket) — see lead_extractor.py.
+            model="gemini-2.5-flash-lite",
         ),
         tts=deepgram.TTS(
             api_key=SETTINGS.DEEPGRAM_API_KEY,
@@ -140,6 +145,10 @@ async def entrypoint(ctx: JobContext) -> None:
             "call_id": call_id,
             "phone":   phone,
             "lead_data": {},
+            # Set True by the transfer_call tool. Once the agent finishes speaking
+            # its closing line (state → listening), the call is hung up. See the
+            # hangup logic in on_state_changed below.
+            "pending_hangup": False,
         },
     )
 
@@ -196,6 +205,19 @@ async def entrypoint(ctx: JobContext) -> None:
             "call_id":  call_id,
         })
 
+    # Guards a single hangup so a flapping "listening" state can't fire it twice.
+    hangup_started = {"v": False}
+
+    async def _hangup_call() -> None:
+        # Let the final TTS audio drain before tearing the room down, otherwise
+        # the customer hears the closing line get clipped.
+        await asyncio.sleep(1.2)
+        try:
+            await ctx.api.room.delete_room(api.DeleteRoomRequest(room=ctx.room.name))
+            LOGGER.info(f"[{call_id}] Room deleted — call hung up after transfer")
+        except Exception as e:
+            LOGGER.error(f"[{call_id}] Hangup failed: {e}")
+
     @session.on("agent_state_changed")
     def on_state_changed(event: AgentStateChangedEvent) -> None:
         state_str = str(event.new_state).lower()
@@ -209,6 +231,22 @@ async def entrypoint(ctx: JobContext) -> None:
             "state":   ui_state,
         })
 
+        # ── Transfer hangup ────────────────────────────────────────────────────
+        # transfer_call set pending_hangup and returned a closing line. The agent
+        # speaks it (state: thinking → speaking → listening); the first time it
+        # settles back to listening, the closing line has played, so we hang up.
+        # (Placeholder for a real SIP transfer later — for now the call just ends,
+        # which triggers _on_shutdown → lead extraction is saved regardless of
+        # whether the customer was interested.)
+        if (
+            ui_state == "listening"
+            and session.userdata.get("pending_hangup")
+            and not hangup_started["v"]
+        ):
+            hangup_started["v"] = True
+            LOGGER.info(f"[{call_id}] Transfer closing line spoken — hanging up")
+            asyncio.create_task(_hangup_call())
+
     # ── Shutdown / post-call cleanup ───────────────────────────────────────────
 
     async def _on_shutdown() -> None:
@@ -217,11 +255,33 @@ async def entrypoint(ctx: JobContext) -> None:
         status = "completed" if call_state["answered"] else call_state["status"]
         LOGGER.info(f"[{call_id}] Shutdown — {duration_s}s, {len(transcript)} turns, status={status}")
 
+        # ── Notify the frontend IMMEDIATELY ────────────────────────────────────
+        # The moment the SIP leg drops (customer hangs up), reset the UI right
+        # away. Lead extraction + summary below are slow Gemini calls (retries +
+        # backoff, several seconds) — they must NOT block the call_ended event,
+        # otherwise the dashboard appears frozen until they finish. The lead panel
+        # already has live data from lead_update events, so call_ended doesn't
+        # need lead_data here.
+        try:
+            from app.api.call import ACTIVE_CALLS
+            ACTIVE_CALLS.pop(call_id, None)
+        except Exception:
+            pass
+        CONNECTION_MANAGER.broadcast_from_thread(call_id, {
+            "type":             "call_ended",
+            "call_id":          call_id,
+            "duration_seconds": duration_s,
+            "lead_data":        {},
+        })
+
+        # ── Post-call processing (runs AFTER the UI has already reset) ──────────
         lead = None
         summary = ""
         lead_dict: dict = {}
         try:
-            lead = await extract_lead_from_transcript(transcript)
+            # Single Gemini call returns BOTH the structured lead and the summary
+            # (previously two separate calls — see extract_lead_and_summary).
+            lead, summary = await extract_lead_and_summary(transcript)
             tool_data = session.userdata.get("lead_data", {})
             for k, v in tool_data.items():
                 if v is not None and getattr(lead, k, None) is None:
@@ -230,9 +290,6 @@ async def entrypoint(ctx: JobContext) -> None:
                     except Exception:
                         pass
             lead_dict = lead.model_dump(exclude_none=True)
-
-            # Short conversation summary for the call-history record.
-            summary = await summarize_transcript(transcript)
 
             await save_call_record(call_id, phone, transcript, duration_s, lead)
             await upsert_lead(call_id, phone, lead, duration_s)
@@ -264,20 +321,6 @@ async def entrypoint(ctx: JobContext) -> None:
                 })
             except Exception as e2:
                 LOGGER.error(f"[{call_id}] History persist failed: {e2}")
-        finally:
-            # Always notify the frontend and clear server-side tracking, even if
-            # post-call processing raised above.
-            try:
-                from app.api.call import ACTIVE_CALLS
-                ACTIVE_CALLS.pop(call_id, None)
-            except Exception:
-                pass
-            CONNECTION_MANAGER.broadcast_from_thread(call_id, {
-                "type":             "call_ended",
-                "call_id":          call_id,
-                "duration_seconds": duration_s,
-                "lead_data":        lead_dict,
-            })
 
     ctx.add_shutdown_callback(_on_shutdown)
 

@@ -1,7 +1,7 @@
 from livekit.agents import Agent
 
 from app.agents.worker_agent.prompts import SYSTEM_PROMPT
-from app.agents.worker_agent.tools import flag_hot_lead, transfer_call, update_lead_fields
+from app.agents.worker_agent.tools import flag_hot_lead, transfer_call
 
 
 class RealEstateAgent(Agent):
@@ -10,5 +10,5 @@ class RealEstateAgent(Agent):
     def __init__(self):
         super().__init__(
             instructions=SYSTEM_PROMPT,
-            tools=[flag_hot_lead, transfer_call, update_lead_fields],
+            tools=[flag_hot_lead, transfer_call],
         )
