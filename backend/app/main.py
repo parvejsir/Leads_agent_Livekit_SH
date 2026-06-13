@@ -17,9 +17,11 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.call import ROUTER as CALL_ROUTER
+from app.api.contacts import ROUTER as CONTACTS_ROUTER
 from app.api.health import ROUTER as HEALTH_ROUTER
 from app.api.history import ROUTER as HISTORY_ROUTER
 from app.core.logging import LOGGER
+from app.services.queue_manager import QUEUE_CHANNEL, QUEUE_MANAGER
 from app.websocket.connection_manager import CONNECTION_MANAGER
 
 
@@ -29,6 +31,13 @@ from app.websocket.connection_manager import CONNECTION_MANAGER
 async def lifespan(app: FastAPI):
     loop = asyncio.get_running_loop()
     CONNECTION_MANAGER.set_loop(loop)
+    QUEUE_MANAGER.set_loop(loop)
+
+    # Resume any campaign interrupted by a restart (re-queues in-flight jobs).
+    try:
+        await QUEUE_MANAGER.recover_from_disk()
+    except Exception as e:
+        LOGGER.error(f"Queue recovery failed: {e}")
 
     LOGGER.info("Starting LiveKit agent worker...")
     worker_task = None
@@ -65,6 +74,7 @@ APP.add_middleware(
 
 APP.include_router(HEALTH_ROUTER)
 APP.include_router(CALL_ROUTER)
+APP.include_router(CONTACTS_ROUTER)
 APP.include_router(HISTORY_ROUTER)
 
 
@@ -79,6 +89,13 @@ async def root():
 async def frontend_ws(websocket: WebSocket, call_id: str):
     await CONNECTION_MANAGER.connect(call_id, websocket)
     LOGGER.info(f"[{call_id}] Frontend WS connected")
+    # Queue subscribers get the current snapshot immediately so the dashboard
+    # isn't blank until the next change.
+    if call_id == QUEUE_CHANNEL:
+        try:
+            await websocket.send_json({"type": "queue_update", **QUEUE_MANAGER.snapshot()})
+        except Exception:
+            pass
     try:
         while True:
             msg = await websocket.receive_text()

@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from livekit import api
 from livekit.agents import AgentServer, AgentSession, AutoSubscribe, JobContext, JobExecutorType, RoomInputOptions
 from livekit.agents import ConversationItemAddedEvent, UserInputTranscribedEvent, AgentStateChangedEvent
+from livekit.agents.voice.events import ErrorEvent
 from livekit.agents.llm import ChatMessage
 from livekit.agents.voice.turn import TurnHandlingOptions
 from livekit.plugins import deepgram, silero
@@ -62,10 +63,20 @@ async def entrypoint(ctx: JobContext) -> None:
 
     call_id: str = metadata.get("call_id", ctx.room.name)
     phone: str   = metadata.get("phone", "unknown")
+    # Contact context from the queue. `name` personalizes the greeting.
+    # `contact_location` is the customer's CURRENT location (from the uploaded
+    # file) — NOT their preferred property location, which is discovered during
+    # the call and stored in LeadData.location. Never conflate the two.
+    name: str | None             = metadata.get("name") or None
+    contact_location: str | None = metadata.get("contact_location") or None
+    contact_id: str | None       = metadata.get("contact_id") or None
     start_time   = time.time()
     start_iso    = datetime.now(timezone.utc).isoformat()
 
-    LOGGER.info(f"[{call_id}] Agent entrypoint — room: {ctx.room.name}, phone: {phone}")
+    LOGGER.info(
+        f"[{call_id}] Agent entrypoint — room: {ctx.room.name}, phone: {phone}, "
+        f"name: {name or '-'}"
+    )
 
     transcript: list[dict] = []
     # Mutable end-state captured by the shutdown handler. "completed" once the
@@ -144,6 +155,9 @@ async def entrypoint(ctx: JobContext) -> None:
         userdata={
             "call_id": call_id,
             "phone":   phone,
+            "name":    name,
+            "contact_location": contact_location,
+            "contact_id": contact_id,
             "lead_data": {},
             # Set True by the transfer_call tool. Once the agent finishes speaking
             # its closing line (state → listening), the call is hung up. See the
@@ -196,13 +210,30 @@ async def entrypoint(ctx: JobContext) -> None:
         if not text:
             return
         LOGGER.info(f"[{call_id}] AGENT: {text[:120]!r}")
+        # Store the final agent turn for lead extraction. The LIVE broadcast (incl.
+        # streaming) is handled by RealEstateAgent.transcription_node — broadcasting
+        # here too would print the agent turn twice on the UI.
         transcript.append({"role": "agent", "text": text})
+
+    # ── Pipeline errors (LLM/STT/TTS) ──────────────────────────────────────────
+    # These were previously swallowed — a Gemini 429 (rate limit) would leave the
+    # agent silent with no clue why. Log loudly and surface to the UI so a silent
+    # agent is diagnosable. The component (e.g. "google.LLM") and message tell you
+    # exactly which provider failed and whether it's a quota/rate-limit error.
+    @session.on("error")
+    def on_error(event: ErrorEvent) -> None:
+        err = event.error
+        label = getattr(err, "label", None) or type(err).__name__
+        message = str(getattr(err, "error", err))
+        recoverable = getattr(err, "recoverable", None)
+        LOGGER.error(
+            f"[{call_id}] PIPELINE ERROR — {label} (recoverable={recoverable}): {message}"
+        )
         CONNECTION_MANAGER.broadcast_from_thread(call_id, {
-            "type":     "transcript",
-            "role":     "agent",
-            "text":     text,
-            "is_final": True,
-            "call_id":  call_id,
+            "type":    "pipeline_error",
+            "call_id": call_id,
+            "label":   str(label),
+            "message": message,
         })
 
     # Guards a single hangup so a flapping "listening" state can't fire it twice.
@@ -263,8 +294,8 @@ async def entrypoint(ctx: JobContext) -> None:
         # already has live data from lead_update events, so call_ended doesn't
         # need lead_data here.
         try:
-            from app.api.call import ACTIVE_CALLS
-            ACTIVE_CALLS.pop(call_id, None)
+            from app.api.call import unregister_active_call
+            unregister_active_call(call_id)
         except Exception:
             pass
         CONNECTION_MANAGER.broadcast_from_thread(call_id, {
@@ -273,6 +304,17 @@ async def entrypoint(ctx: JobContext) -> None:
             "duration_seconds": duration_s,
             "lead_data":        {},
         })
+
+        # Free the queue slot → auto-dials the next pending contact. Outcome:
+        # answered ⇒ completed; SIP failure ⇒ failed; otherwise no_answer.
+        outcome = "completed" if call_state["answered"] else call_state["status"]
+        try:
+            from app.services.queue_manager import QUEUE_MANAGER
+            QUEUE_MANAGER.notify_call_ended_from_thread(
+                call_id, outcome, error=None if call_state["answered"] else call_state.get("error"),
+            )
+        except Exception:
+            pass
 
         # ── Post-call processing (runs AFTER the UI has already reset) ──────────
         lead = None
@@ -296,6 +338,9 @@ async def entrypoint(ctx: JobContext) -> None:
             await save_call_history({
                 "call_id":          call_id,
                 "phone":            phone,
+                "name":             name,
+                "contact_location": contact_location,
+                "contact_id":       contact_id,
                 "start_time":       start_iso,
                 "end_time":         end_iso,
                 "duration_seconds": duration_s,
@@ -370,9 +415,16 @@ async def entrypoint(ctx: JobContext) -> None:
             "type":    "call_connected",
             "call_id": call_id,
         })
+        # Move the queue job dialing → active.
+        try:
+            from app.services.queue_manager import QUEUE_MANAGER
+            QUEUE_MANAGER.notify_call_connected_from_thread(call_id)
+        except Exception:
+            pass
     except Exception as e:
         LOGGER.error(f"[{call_id}] SIP call failed: {e}")
         call_state["status"] = "failed"
+        call_state["error"] = str(e)
         session_task.cancel()
         return
 
@@ -380,12 +432,21 @@ async def entrypoint(ctx: JobContext) -> None:
 
     # ── Opening greeting (persona-driven, not hardcoded) ───────────────────────
     LOGGER.info(f"[{call_id}] Triggering greeting")
-    greeting_handle = session.generate_reply(
-        instructions=(
+    if name:
+        # Known contact → greet by name. contact_location is their current city,
+        # given only as soft rapport context — do NOT assume it's where they want
+        # to buy property.
+        greet_instructions = (
+            f"The call just connected. Greet the customer by name — say something like "
+            f"'Hi {name}, this is Arjun from HomePro Realty'. Be warm, natural and "
+            f"conversational — no scripts, no bullet points."
+        )
+    else:
+        greet_instructions = (
             "The call just connected. Greet the customer warmly as Arjun from HomePro Realty. "
             "Be natural and conversational — no scripts, no bullet points."
         )
-    )
+    greeting_handle = session.generate_reply(instructions=greet_instructions)
 
     # ── Silence fallback — starts AFTER greeting finishes, not when call connects
     # Counting from call connect left only ~5s after a ~7s greeting. Now the user

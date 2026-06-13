@@ -15,4 +15,8 @@ livekit-plugins-elevenlabs
 livekit-plugins-silero
 livekit-plugins-google
 openai>=1.30.0
+# Bulk contact import (CSV/XLSX/XLS)
+pandas
+openpyxl
+xlrd
 # audioop-lts  # uncomment if upgrading to Python 3.13+

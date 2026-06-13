@@ -14,14 +14,38 @@ def _make_client() -> api.LiveKitAPI:
     )
 
 
-async def create_room(call_id: str, phone: str = "") -> str:
+def _call_metadata(
+    call_id: str,
+    phone: str,
+    name: str | None,
+    contact_location: str | None,
+    contact_id: str | None,
+) -> str:
+    # contact_location is the customer's CURRENT location — never the preferred
+    # property location (that is extracted from the conversation into LeadData).
+    return json.dumps({
+        "call_id": call_id,
+        "phone": phone,
+        "name": name,
+        "contact_location": contact_location,
+        "contact_id": contact_id,
+    })
+
+
+async def create_room(
+    call_id: str,
+    phone: str = "",
+    name: str | None = None,
+    contact_location: str | None = None,
+    contact_id: str | None = None,
+) -> str:
     room_name = f"{ROOM_PREFIX}-{call_id}"
     client = _make_client()
     try:
         await client.room.create_room(
             api.CreateRoomRequest(
                 name=room_name,
-                metadata=json.dumps({"call_id": call_id, "phone": phone}),
+                metadata=_call_metadata(call_id, phone, name, contact_location, contact_id),
                 empty_timeout=300,   # auto-delete after 5min empty
                 max_participants=10,
             )
@@ -31,7 +55,14 @@ async def create_room(call_id: str, phone: str = "") -> str:
     return room_name
 
 
-async def dispatch_agent(room_name: str, call_id: str, phone_number: str) -> str:
+async def dispatch_agent(
+    room_name: str,
+    call_id: str,
+    phone_number: str,
+    name: str | None = None,
+    contact_location: str | None = None,
+    contact_id: str | None = None,
+) -> str:
     """Dispatch the real estate agent to the room so it's ready when audio arrives."""
     client = _make_client()
     try:
@@ -39,7 +70,7 @@ async def dispatch_agent(room_name: str, call_id: str, phone_number: str) -> str
             api.CreateAgentDispatchRequest(
                 agent_name=AGENT_NAME,
                 room=room_name,
-                metadata=f'{{"call_id": "{call_id}", "phone": "{phone_number}"}}',
+                metadata=_call_metadata(call_id, phone_number, name, contact_location, contact_id),
             )
         )
         return dispatch.id if dispatch else ""

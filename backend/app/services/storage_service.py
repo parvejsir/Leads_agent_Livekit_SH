@@ -10,9 +10,14 @@ STORAGE_DIR = Path(__file__).parent.parent.parent / "storage"
 DB_FILE = STORAGE_DIR / "db.txt"
 LEADS_FILE = STORAGE_DIR / "leads.json"
 CALLS_FILE = STORAGE_DIR / "calls.json"
+QUEUE_FILE = STORAGE_DIR / "queue.json"
 
 _leads_lock = asyncio.Lock()
 _calls_lock = asyncio.Lock()
+# db.txt is a shared append-only file. Without a lock, concurrent calls
+# interleave their transcript blocks. Guards save_call_record below.
+_db_lock = asyncio.Lock()
+_queue_lock = asyncio.Lock()
 
 
 def _ensure_storage():
@@ -23,6 +28,8 @@ def _ensure_storage():
         LEADS_FILE.write_text("[]", encoding="utf-8")
     if not CALLS_FILE.exists():
         CALLS_FILE.write_text("[]", encoding="utf-8")
+    if not QUEUE_FILE.exists():
+        QUEUE_FILE.write_text("[]", encoding="utf-8")
 
 
 async def save_call_record(
@@ -54,7 +61,9 @@ async def save_call_record(
         with open(DB_FILE, "a", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
 
-    await asyncio.to_thread(_write)
+    # Lock so concurrent calls don't interleave blocks in the append-only log.
+    async with _db_lock:
+        await asyncio.to_thread(_write)
 
 
 async def upsert_lead(
@@ -149,5 +158,35 @@ async def get_call_history(call_id: str) -> Optional[dict]:
             if c.get("call_id") == call_id:
                 return c
         return None
+
+    return await asyncio.to_thread(_read)
+
+
+# ── Call queue persistence (storage/queue.json) ───────────────────────────────
+
+async def save_queue(jobs: list[dict]) -> None:
+    """Persist the full set of queue jobs (atomic temp-replace)."""
+    async with _queue_lock:
+        def _write():
+            _ensure_storage()
+            tmp = QUEUE_FILE.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps(jobs, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            tmp.replace(QUEUE_FILE)
+
+        await asyncio.to_thread(_write)
+
+
+async def load_queue() -> list[dict]:
+    """Load persisted queue jobs (empty list if none/corrupt)."""
+    def _read():
+        _ensure_storage()
+        try:
+            content = QUEUE_FILE.read_text(encoding="utf-8").strip()
+            return json.loads(content) if content else []
+        except (json.JSONDecodeError, FileNotFoundError):
+            return []
 
     return await asyncio.to_thread(_read)
