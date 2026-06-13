@@ -21,6 +21,42 @@ export interface TranscriptEntry {
 
 export type AgentState = "idle" | "listening" | "thinking" | "speaking";
 
+// Call queue job — mirrors backend app/schemas/queue_schema.py
+export type JobStatus =
+  | "pending"
+  | "dialing"
+  | "active"
+  | "completed"
+  | "failed"
+  | "busy"
+  | "no_answer"
+  | "voicemail";
+
+export interface CallJob {
+  id: string;
+  phone: string;
+  name?: string | null;
+  // Customer's CURRENT location (from upload) — NOT preferred property location.
+  contact_location?: string | null;
+  contact_id?: string | null;
+  batch_id?: string | null;
+  status: JobStatus;
+  attempts: number;
+  call_id?: string | null;
+  error?: string | null;
+  created_at: string;
+  started_at?: string | null;
+  ended_at?: string | null;
+}
+
+export interface QueueSnapshot {
+  jobs: CallJob[];
+  counts: Partial<Record<JobStatus, number>>;
+  active: string[];        // active call_ids
+  pending: number;
+  max_concurrent: number;
+}
+
 // WebSocket event types sent by the backend
 export type WsEvent =
   | { type: "transcript"; role: "user" | "agent"; text: string; is_final: boolean; call_id: string }
@@ -30,6 +66,8 @@ export type WsEvent =
   | { type: "hot_lead_flagged"; call_id: string; reason: string }
   | { type: "call_transferred"; call_id: string; reason: string }
   | { type: "call_ended"; call_id: string; duration_seconds: number; lead_data?: LeadData }
+  | { type: "pipeline_error"; call_id: string; label: string; message: string }
+  | ({ type: "queue_update" } & QueueSnapshot)
   | { type: "pong" };
 
 export interface CallSession {

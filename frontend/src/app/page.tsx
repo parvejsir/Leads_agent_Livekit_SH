@@ -1,153 +1,96 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 import { useCallWebSocket } from "@/hooks/useCallWebSocket";
-import CallPanel from "@/components/CallPanel";
-import TranscriptPanel from "@/components/Transcript";
-import LeadPanel from "@/components/LeadPanel";
-import AgentStatus from "@/components/AgentStatus";
+import ManualDial from "@/components/ManualDial";
+import QueuePanel from "@/components/QueuePanel";
+import CallGrid from "@/components/CallGrid";
 import Nav from "@/components/Nav";
-import { CallSession, TranscriptEntry, LeadData, AgentState, WsEvent } from "@/types";
+import { QueueSnapshot, WsEvent } from "@/types";
+
+// Reserved backend channel that streams queue/progress updates.
+const QUEUE_CHANNEL = "__queue__";
 
 export default function Dashboard() {
-  const [session, setSession] = useState<CallSession | null>(null);
-  const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
-  const [lead, setLead] = useState<Partial<LeadData>>({});
-  const [agentState, setAgentState] = useState<AgentState>("idle");
-  const [isConnected, setIsConnected] = useState(false);
-  const [isHot, setIsHot] = useState(false);
+  const [snapshot, setSnapshot] = useState<QueueSnapshot | null>(null);
   const [notification, setNotification] = useState("");
+  const prevActive = useRef<Set<string>>(new Set());
 
-  const showNotification = (msg: string) => {
+  const showNotification = useCallback((msg: string) => {
     setNotification(msg);
     setTimeout(() => setNotification(""), 4000);
-  };
-
-  // Single source of truth for returning the UI to a brand-new-call state.
-  // Used by both the call_ended event and the manual End button so no stale
-  // transcript/lead/state can leak into the next call.
-  const resetCallState = useCallback(() => {
-    setSession(null);
-    setTranscript([]);
-    setLead({});
-    setIsHot(false);
-    setIsConnected(false);
-    setAgentState("idle");
   }, []);
 
-  const handleEvent = useCallback((event: WsEvent) => {
-    switch (event.type) {
-      case "call_connected":
-        setIsConnected(true);
-        setSession((s) => s ? { ...s, status: "connected" } : s);
-        break;
+  // Single queue socket drives the whole dashboard. Each active call additionally
+  // opens its own socket inside its CallTile (see CallGrid).
+  const handleQueueEvent = useCallback((event: WsEvent) => {
+    if (event.type !== "queue_update") return;
+    const snap: QueueSnapshot = {
+      jobs: event.jobs,
+      counts: event.counts,
+      active: event.active,
+      pending: event.pending,
+      max_concurrent: event.max_concurrent,
+    };
+    setSnapshot(snap);
 
-      case "transcript":
-        setTranscript((prev) => {
-          // Replace last interim entry if this is also interim for same role
-          if (!event.is_final) {
-            const last = prev[prev.length - 1];
-            if (last && last.role === event.role && !last.is_final) {
-              return [
-                ...prev.slice(0, -1),
-                { role: event.role, text: event.text, is_final: false, timestamp: Date.now() },
-              ];
-            }
-            return [...prev, { role: event.role, text: event.text, is_final: false, timestamp: Date.now() }];
-          }
-          // Final: replace last interim or append
-          const last = prev[prev.length - 1];
-          if (last && last.role === event.role && !last.is_final) {
-            return [
-              ...prev.slice(0, -1),
-              { role: event.role, text: event.text, is_final: true, timestamp: Date.now() },
-            ];
-          }
-          return [...prev, { role: event.role, text: event.text, is_final: true, timestamp: Date.now() }];
-        });
-        break;
-
-      case "lead_update":
-        setLead((prev) => ({ ...prev, ...event.data }));
-        break;
-
-      case "agent_state":
-        setAgentState(event.state);
-        break;
-
-      case "hot_lead_flagged":
-        setIsHot(true);
-        showNotification(`🔥 Hot Lead! ${event.reason}`);
-        break;
-
-      case "call_transferred":
-        showNotification(`📲 Call transferred: ${event.reason}`);
-        break;
-
-      case "call_ended":
-        showNotification(`Call ended (${event.duration_seconds}s) — saved to history`);
-        resetCallState();
-        break;
+    // Notify when a new call goes live.
+    const now = new Set(snap.active);
+    for (const cid of now) {
+      if (!prevActive.current.has(cid)) {
+        const job = snap.jobs.find((j) => j.call_id === cid);
+        showNotification(`📲 Dialing ${job?.name || job?.phone || cid}`);
+      }
     }
-  }, [resetCallState]);
+    prevActive.current = now;
+  }, [showNotification]);
 
-  useCallWebSocket(session?.callId ?? null, handleEvent);
+  useCallWebSocket(QUEUE_CHANNEL, handleQueueEvent);
 
-  const handleCallStarted = (s: CallSession) => {
-    setSession(s);
-    setTranscript([]);
-    setLead({});
-    setIsHot(false);
-    setIsConnected(false);
-    setAgentState("idle");
-  };
-
-  const handleCallEnded = () => {
-    resetCallState();
-  };
+  const activeCount = snapshot?.active.length ?? 0;
+  const pending = snapshot?.pending ?? 0;
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-100 to-blue-50">
-      {/* Header */}
       <Nav>
         <span
           className={`text-xs px-2 py-1 rounded-full font-medium ${
-            isConnected
+            activeCount > 0
               ? "bg-green-100 text-green-700"
-              : session
+              : pending > 0
               ? "bg-yellow-100 text-yellow-700"
               : "bg-gray-100 text-gray-500"
           }`}
         >
-          {isConnected ? "● Live" : session ? "● Connecting" : "● Idle"}
+          {activeCount > 0
+            ? `● ${activeCount} Live`
+            : pending > 0
+            ? `● ${pending} Queued`
+            : "● Idle"}
         </span>
       </Nav>
 
-      {/* Notification banner */}
       {notification && (
         <div className="bg-blue-600 text-white text-sm text-center py-2 px-4 animate-fade-in">
           {notification}
         </div>
       )}
 
-      {/* Main layout */}
       <main className="max-w-7xl mx-auto px-6 py-6">
         <div className="grid grid-cols-12 gap-4 h-[calc(100vh-140px)]">
-          {/* Left column */}
-          <div className="col-span-3 flex flex-col gap-4">
-            <AgentStatus state={agentState} isConnected={isConnected} />
-            <CallPanel
-              key={session?.callId ?? "idle"}
-              session={session}
-              onCallStarted={handleCallStarted}
-              onCallEnded={handleCallEnded}
-            />
-            <LeadPanel lead={lead} isHot={isHot} />
+          {/* Left: controls + queue */}
+          <div className="col-span-4 xl:col-span-3 flex flex-col gap-4 min-h-0">
+            <ManualDial onQueued={showNotification} />
+            <QueuePanel snapshot={snapshot} />
           </div>
 
-          {/* Right column — transcript */}
-          <div className="col-span-9">
-            <TranscriptPanel entries={transcript} callId={session?.callId ?? null} />
+          {/* Right: live concurrent calls */}
+          <div className="col-span-8 xl:col-span-9 min-h-0">
+            <CallGrid
+              jobs={snapshot?.jobs ?? []}
+              activeCallIds={snapshot?.active ?? []}
+              maxConcurrent={snapshot?.max_concurrent ?? 2}
+            />
           </div>
         </div>
       </main>
